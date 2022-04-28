@@ -17,6 +17,7 @@ from six import text_type
 from sqlalchemy import MetaData, inspect
 from sqlalchemy.sql import expression, select, delete
 from sqlalchemy.exc import OperationalError
+from sqlalchemy.orm import sessionmaker
 
 from rdflib_sqlalchemy.constants import (
     ASSERTED_LITERAL_PARTITION,
@@ -115,6 +116,7 @@ class SQLAlchemy(Store, SQLGeneratorMixin, StatisticsMixin):
         """
         self.identifier = identifier and identifier or "hardcoded"
         self.engine = engine
+        self.Session = sessionmaker(self.engine)
         self.max_terms_per_where = max_terms_per_where
 
         # Use only the first 10 bytes of the digest
@@ -160,8 +162,8 @@ class SQLAlchemy(Store, SQLGeneratorMixin, StatisticsMixin):
         ]
         q = union_select(selects, distinct=False, select_type=COUNT_SELECT)
         if hasattr(self, "engine"):
-            with self.engine.connect() as connection:
-                res = connection.execute(q)
+            with self.Session() as session:
+                res = session.execute(q)
                 rt = res.fetchall()
                 typeLen, quotedLen, assertedLen, literalLen = [
                     rtTuple[0] for rtTuple in rt]
@@ -216,8 +218,8 @@ class SQLAlchemy(Store, SQLGeneratorMixin, StatisticsMixin):
                  ASSERTED_LITERAL_PARTITION), ]
             q = union_select(selects, distinct=False, select_type=COUNT_SELECT)
 
-        with self.engine.connect() as connection:
-            res = connection.execute(q)
+        with self.Session() as session:
+            res = session.execute(q)
             rt = res.fetchall()
             return int(sum(rtTuple[0] for rtTuple in rt))
 
@@ -274,6 +276,7 @@ class SQLAlchemy(Store, SQLGeneratorMixin, StatisticsMixin):
             kwargs = configuration
 
         self.engine = sqlalchemy.create_engine(url, **kwargs)
+        self.Session.configure(bind=self.engine)
         try:
             conn = self.engine.connect()
         except OperationalError:
@@ -308,6 +311,7 @@ class SQLAlchemy(Store, SQLGeneratorMixin, StatisticsMixin):
         """
         if self.engine is None:
             self.engine = self.open(configuration, create=False)
+            self.Session.configure(bind=self.engine)
 
         with self.engine.begin():
             try:
@@ -328,9 +332,9 @@ class SQLAlchemy(Store, SQLGeneratorMixin, StatisticsMixin):
         )
 
         statement = self._add_ignore_on_conflict(statement)
-        with self.engine.begin() as connection:
+        with self.Session.begin() as session:
             try:
-                connection.execute(statement, params)
+                session.execute(statement, params)
             except Exception:
                 _logger.exception(
                     "Add failed with statement: %s, params: %s",
@@ -354,11 +358,11 @@ class SQLAlchemy(Store, SQLGeneratorMixin, StatisticsMixin):
             command_dict.setdefault("statement", statement)
             command_dict.setdefault("params", []).append(params)
 
-        with self.engine.begin() as connection:
+        with self.Session.begin() as session:
             try:
                 for command in commands_dict.values():
                     statement = self._add_ignore_on_conflict(command['statement'])
-                    connection.execute(statement, command["params"])
+                    session.execute(statement, command["params"])
             except Exception:
                 _logger.exception("AddN failed.")
                 raise
@@ -388,7 +392,7 @@ class SQLAlchemy(Store, SQLGeneratorMixin, StatisticsMixin):
         asserted_type_table = self.tables["type_statements"]
         literal_table = self.tables["literal_statements"]
 
-        with self.engine.begin() as connection:
+        with self.Session.begin() as session:
             try:
                 if predicate is None or predicate != RDF.type:
                     # Need to remove predicates other than rdf:type
@@ -396,7 +400,7 @@ class SQLAlchemy(Store, SQLGeneratorMixin, StatisticsMixin):
                     if not self.STRONGLY_TYPED_TERMS or isinstance(obj, Literal):
                         # remove literal triple
                         clause = self.build_clause(literal_table, subject, predicate, obj, context)
-                        connection.execute(literal_table.delete(clause))
+                        session.execute(literal_table.delete(clause))
 
                     for table in [quoted_table, asserted_table]:
                         # If asserted non rdf:type table and obj is Literal,
@@ -405,16 +409,16 @@ class SQLAlchemy(Store, SQLGeneratorMixin, StatisticsMixin):
                             continue
                         else:
                             clause = self.build_clause(table, subject, predicate, obj, context)
-                            connection.execute(table.delete(clause))
+                            session.execute(table.delete(clause))
 
                 if predicate == RDF.type or predicate is None:
                     # Need to check rdf:type and quoted partitions (in addition
                     # perhaps)
                     clause = self.build_clause(asserted_type_table, subject, RDF.type, obj, context, True)
-                    connection.execute(asserted_type_table.delete(clause))
+                    session.execute(asserted_type_table.delete(clause))
 
                     clause = self.build_clause(quoted_table, subject, predicate, obj, context)
-                    connection.execute(quoted_table.delete(clause))
+                    session.execute(quoted_table.delete(clause))
             except Exception:
                 _logger.exception("Removal failed.")
                 raise
@@ -492,8 +496,8 @@ class SQLAlchemy(Store, SQLGeneratorMixin, StatisticsMixin):
 
     def _do_triples_select(self, selects, context):
         q = union_select(selects, distinct=True, select_type=TRIPLE_SELECT_NO_ORDER)
-        with self.engine.connect() as connection:
-            res = connection.execute(q)
+        with self.Session() as session:
+            res = session.execute(q)
             # TODO: False but it may have limitations on text column. Check
             # NOTE: SQLite does not support ORDER BY terms that aren't
             # integers, so the entire result set must be iterated in order
@@ -626,8 +630,8 @@ class SQLAlchemy(Store, SQLGeneratorMixin, StatisticsMixin):
                 (literal, None, ASSERTED_LITERAL_PARTITION), ]
             q = union_select(selects, distinct=True, select_type=CONTEXT_SELECT)
 
-        with self.engine.connect() as connection:
-            res = connection.execute(q)
+        with self.Session() as session:
+            res = session.execute(q)
             rt = res.fetchall()
         for context in [rtTuple[0] for rtTuple in rt]:
             yield URIRef(context)
@@ -636,26 +640,26 @@ class SQLAlchemy(Store, SQLGeneratorMixin, StatisticsMixin):
 
     def bind(self, prefix, namespace):
         """Bind prefix for namespace."""
-        with self.engine.begin() as connection:
+        with self.Session.begin() as session:
             try:
                 binds_table = self.tables["namespace_binds"]
                 prefix = text_type(prefix)
                 namespace = text_type(namespace)
-                connection.execute(delete(binds_table).where(
+                session.execute(delete(binds_table).where(
                     expression.or_(binds_table.c.uri == namespace,
                         binds_table.c.prefix == prefix)))
-                connection.execute(binds_table.insert().values(prefix=prefix, uri=namespace))
+                session.execute(binds_table.insert().values(prefix=prefix, uri=namespace))
             except Exception:
                 _logger.exception("Namespace binding failed.")
                 raise
 
     def prefix(self, namespace):
         """Prefix."""
-        with self.engine.begin() as connection:
+        with self.Session.begin() as session:
             nb_table = self.tables["namespace_binds"]
             namespace = text_type(namespace)
             s = select([nb_table.c.prefix]).where(nb_table.c.uri == namespace)
-            res = connection.execute(s)
+            res = session.execute(s)
             rt = [rtTuple[0] for rtTuple in res.fetchall()]
             res.close()
             if rt and (rt[0] or rt[0] == ""):
@@ -666,10 +670,10 @@ class SQLAlchemy(Store, SQLGeneratorMixin, StatisticsMixin):
         res = None
         prefix_val = text_type(prefix)
         try:
-            with self.engine.begin() as connection:
+            with self.Session.begin() as session:
                 nb_table = self.tables["namespace_binds"]
                 s = select([nb_table.c.uri]).where(nb_table.c.prefix == prefix_val)
-                res = connection.execute(s)
+                res = session.execute(s)
                 rt = [rtTuple[0] for rtTuple in res.fetchall()]
                 res.close()
                 return rt and URIRef(rt[0]) or None
@@ -678,8 +682,8 @@ class SQLAlchemy(Store, SQLGeneratorMixin, StatisticsMixin):
             return None
 
     def namespaces(self):
-        with self.engine.begin() as connection:
-            res = connection.execute(self.tables["namespace_binds"].select(distinct=True))
+        with self.Session.begin() as session:
+            res = session.execute(self.tables["namespace_binds"].select(distinct=True))
             for prefix, uri in res.fetchall():
                 yield prefix, uri
 
@@ -749,12 +753,12 @@ class SQLAlchemy(Store, SQLGeneratorMixin, StatisticsMixin):
         asserted_type_table = self.tables["type_statements"]
         literal_table = self.tables["literal_statements"]
 
-        with self.engine.begin() as connection:
+        with self.Session.begin() as session:
             try:
                 for table in [quoted_table, asserted_table,
                               asserted_type_table, literal_table]:
                     clause = self.build_context_clause(context, table)
-                    connection.execute(table.delete(clause))
+                    session.execute(table.delete(clause))
             except Exception:
                 _logger.exception("Context removal failed.")
                 raise

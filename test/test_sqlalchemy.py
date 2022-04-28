@@ -107,8 +107,8 @@ class SQLATestCase(unittest.TestCase):
 
     def test_triples_choices(self):
         # Create a mock for the sqlalchemy engine so we can capture the arguments
-        p = MagicMock(name='engine')
-        self.store.engine = p
+        p = MagicMock(name='Session')
+        self.store.Session = p
 
         # Set this so we're not including selects for both asserted and literal tables for
         # a choice
@@ -118,7 +118,7 @@ class SQLATestCase(unittest.TestCase):
         # force execution of the generator
         for x in self.store.triples_choices((None, likes, [michel, pizza, likes])):
             pass
-        args = p.connect().__enter__().execute.call_args[0]
+        args = p().__enter__().execute.call_args[0]
         children = args[0].get_children(column_collections=False)
         # Expect two selects: one for the first two choices plus one for the last one
         self.assertEqual(sum(1 for c in children if isinstance(c, Select)), 2)
