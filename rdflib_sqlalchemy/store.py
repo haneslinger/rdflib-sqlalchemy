@@ -17,7 +17,6 @@ from six import text_type
 from sqlalchemy import MetaData, inspect
 from sqlalchemy.sql import expression, select, delete
 from sqlalchemy.exc import OperationalError
-from sqlalchemy.orm import sessionmaker
 
 from rdflib_sqlalchemy.constants import (
     ASSERTED_LITERAL_PARTITION,
@@ -97,7 +96,7 @@ class SQLAlchemy(Store, SQLGeneratorMixin, StatisticsMixin):
     regex_matching = PYTHON_REGEX
     configuration = Literal("sqlite://")
 
-    def __init__(self, identifier=None, configuration=None, engine=None,
+    def __init__(self, session_manger=None, identifier=None, configuration=None, engine=None,
                  max_terms_per_where=800):
         """
         Initialisation.
@@ -114,9 +113,9 @@ class SQLAlchemy(Store, SQLGeneratorMixin, StatisticsMixin):
                 back-end with SQLITE_MAX_EXPR_DEPTH limit and SQLITE_LIMIT_COMPOUND_SELECT
                 -- must find a balance that doesn't hit either of those.
         """
-        self.identifier = identifier and identifier or "hardcoded"
         self.engine = engine
-        self.Session = sessionmaker(self.engine)
+        self.session_manger = session_manger
+        self.identifier = identifier and identifier or "hardcoded"
         self.max_terms_per_where = max_terms_per_where
 
         # Use only the first 10 bytes of the digest
@@ -162,11 +161,10 @@ class SQLAlchemy(Store, SQLGeneratorMixin, StatisticsMixin):
         ]
         q = union_select(selects, distinct=False, select_type=COUNT_SELECT)
         if hasattr(self, "engine"):
-            with self.Session() as session:
-                res = session.execute(q)
-                rt = res.fetchall()
-                typeLen, quotedLen, assertedLen, literalLen = [
-                    rtTuple[0] for rtTuple in rt]
+            res = self.session_manger.session.execute(q)
+            rt = res.fetchall()
+            typeLen, quotedLen, assertedLen, literalLen = [
+                rtTuple[0] for rtTuple in rt]
             try:
                 return ("<Partitioned SQL N3 Store: %s "
                         "contexts, %s classification assertions, "
@@ -218,10 +216,9 @@ class SQLAlchemy(Store, SQLGeneratorMixin, StatisticsMixin):
                  ASSERTED_LITERAL_PARTITION), ]
             q = union_select(selects, distinct=False, select_type=COUNT_SELECT)
 
-        with self.Session() as session:
-            res = session.execute(q)
-            rt = res.fetchall()
-            return int(sum(rtTuple[0] for rtTuple in rt))
+        res = self.session_manger.session.execute(q)
+        rt = res.fetchall()
+        return int(sum(rtTuple[0] for rtTuple in rt))
 
     @property
     def table_names(self):
@@ -240,7 +237,7 @@ class SQLAlchemy(Store, SQLGeneratorMixin, StatisticsMixin):
             np.register(Variable, "V")
         return self._node_pickler
 
-    def open(self, configuration, create=True):
+    def open(self, configuration, session_manager, create=True):
         """
         Open the store specified by the configuration parameter.
 
@@ -275,8 +272,7 @@ class SQLAlchemy(Store, SQLGeneratorMixin, StatisticsMixin):
                 raise Exception('Configuration dict is missing the required "url" key')
             kwargs = configuration
 
-        self.engine = sqlalchemy.create_engine(url, **kwargs)
-        self.Session.configure(bind=self.engine)
+        self.session_manger = session_manager
         try:
             conn = self.engine.connect()
         except OperationalError:
@@ -305,21 +301,6 @@ class SQLAlchemy(Store, SQLGeneratorMixin, StatisticsMixin):
             self.engine.dispose()
         self.engine = None
 
-    def destroy(self, configuration):
-        """
-        Delete all tables and stored data associated with the store.
-        """
-        if self.engine is None:
-            self.engine = self.open(configuration, create=False)
-            self.Session.configure(bind=self.engine)
-
-        with self.engine.begin():
-            try:
-                self.metadata.drop_all(self.engine)
-            except Exception:
-                _logger.exception("unable to drop table.")
-                raise
-
     # Triple Methods
 
     def add(self, triple, context=None, quoted=False):
@@ -332,15 +313,14 @@ class SQLAlchemy(Store, SQLGeneratorMixin, StatisticsMixin):
         )
 
         statement = self._add_ignore_on_conflict(statement)
-        with self.Session.begin() as session:
-            try:
-                session.execute(statement, params)
-            except Exception:
-                _logger.exception(
-                    "Add failed with statement: %s, params: %s",
-                    str(statement), repr(params)
-                )
-                raise
+        try:
+            self.session_manger.session.execute(statement, params)
+        except Exception:
+            _logger.exception(
+                "Add failed with statement: %s, params: %s",
+                str(statement), repr(params)
+            )
+            raise
 
     def addN(self, quads):
         """Add a list of triples in quads form."""
@@ -358,14 +338,13 @@ class SQLAlchemy(Store, SQLGeneratorMixin, StatisticsMixin):
             command_dict.setdefault("statement", statement)
             command_dict.setdefault("params", []).append(params)
 
-        with self.Session.begin() as session:
-            try:
-                for command in commands_dict.values():
-                    statement = self._add_ignore_on_conflict(command['statement'])
-                    session.execute(statement, command["params"])
-            except Exception:
-                _logger.exception("AddN failed.")
-                raise
+        try:
+            for command in commands_dict.values():
+                statement = self._add_ignore_on_conflict(command['statement'])
+                self.session_manger.session.execute(statement, command["params"])
+        except Exception:
+            _logger.exception("AddN failed.")
+            raise
 
     def _add_ignore_on_conflict(self, statement):
         if self.engine.name == 'sqlite':
@@ -392,36 +371,35 @@ class SQLAlchemy(Store, SQLGeneratorMixin, StatisticsMixin):
         asserted_type_table = self.tables["type_statements"]
         literal_table = self.tables["literal_statements"]
 
-        with self.Session.begin() as session:
-            try:
-                if predicate is None or predicate != RDF.type:
-                    # Need to remove predicates other than rdf:type
+        try:
+            if predicate is None or predicate != RDF.type:
+                # Need to remove predicates other than rdf:type
 
-                    if not self.STRONGLY_TYPED_TERMS or isinstance(obj, Literal):
-                        # remove literal triple
-                        clause = self.build_clause(literal_table, subject, predicate, obj, context)
-                        session.execute(literal_table.delete(clause))
+                if not self.STRONGLY_TYPED_TERMS or isinstance(obj, Literal):
+                    # remove literal triple
+                    clause = self.build_clause(literal_table, subject, predicate, obj, context)
+                    self.session_manger.session.execute(literal_table.delete(clause))
 
-                    for table in [quoted_table, asserted_table]:
-                        # If asserted non rdf:type table and obj is Literal,
-                        # don't do anything (already taken care of)
-                        if table == asserted_table and isinstance(obj, Literal):
-                            continue
-                        else:
-                            clause = self.build_clause(table, subject, predicate, obj, context)
-                            session.execute(table.delete(clause))
+                for table in [quoted_table, asserted_table]:
+                    # If asserted non rdf:type table and obj is Literal,
+                    # don't do anything (already taken care of)
+                    if table == asserted_table and isinstance(obj, Literal):
+                        continue
+                    else:
+                        clause = self.build_clause(table, subject, predicate, obj, context)
+                        self.session_manger.session.execute(table.delete(clause))
 
-                if predicate == RDF.type or predicate is None:
-                    # Need to check rdf:type and quoted partitions (in addition
-                    # perhaps)
-                    clause = self.build_clause(asserted_type_table, subject, RDF.type, obj, context, True)
-                    session.execute(asserted_type_table.delete(clause))
+            if predicate == RDF.type or predicate is None:
+                # Need to check rdf:type and quoted partitions (in addition
+                # perhaps)
+                clause = self.build_clause(asserted_type_table, subject, RDF.type, obj, context, True)
+                self.session_manger.session.execute(asserted_type_table.delete(clause))
 
-                    clause = self.build_clause(quoted_table, subject, predicate, obj, context)
-                    session.execute(quoted_table.delete(clause))
-            except Exception:
-                _logger.exception("Removal failed.")
-                raise
+                clause = self.build_clause(quoted_table, subject, predicate, obj, context)
+                self.session_manger.session.execute(quoted_table.delete(clause))
+        except Exception:
+            _logger.exception("Removal failed.")
+            raise
 
     def _triples_helper(self, triple, context=None):
         subject, predicate, obj = triple
@@ -496,13 +474,12 @@ class SQLAlchemy(Store, SQLGeneratorMixin, StatisticsMixin):
 
     def _do_triples_select(self, selects, context):
         q = union_select(selects, distinct=True, select_type=TRIPLE_SELECT_NO_ORDER)
-        with self.Session() as session:
-            res = session.execute(q)
-            # TODO: False but it may have limitations on text column. Check
-            # NOTE: SQLite does not support ORDER BY terms that aren't
-            # integers, so the entire result set must be iterated in order
-            # to be able to return a generator of contexts
-            result = res.fetchall()
+        res = self.session_manger.session.execute(q)
+        # TODO: False but it may have limitations on text column. Check
+        # NOTE: SQLite does not support ORDER BY terms that aren't
+        # integers, so the entire result set must be iterated in order
+        # to be able to return a generator of contexts
+        result = res.fetchall()
         tripleCoverage = {}
 
         for rt in result:
@@ -630,9 +607,8 @@ class SQLAlchemy(Store, SQLGeneratorMixin, StatisticsMixin):
                 (literal, None, ASSERTED_LITERAL_PARTITION), ]
             q = union_select(selects, distinct=True, select_type=CONTEXT_SELECT)
 
-        with self.Session() as session:
-            res = session.execute(q)
-            rt = res.fetchall()
+        res = self.session_manger.session.execute(q)
+        rt = res.fetchall()
         for context in [rtTuple[0] for rtTuple in rt]:
             yield URIRef(context)
 
@@ -640,52 +616,49 @@ class SQLAlchemy(Store, SQLGeneratorMixin, StatisticsMixin):
 
     def bind(self, prefix, namespace):
         """Bind prefix for namespace."""
-        with self.Session.begin() as session:
-            try:
-                binds_table = self.tables["namespace_binds"]
-                prefix = text_type(prefix)
-                namespace = text_type(namespace)
-                session.execute(delete(binds_table).where(
-                    expression.or_(binds_table.c.uri == namespace,
-                        binds_table.c.prefix == prefix)))
-                session.execute(binds_table.insert().values(prefix=prefix, uri=namespace))
-            except Exception:
-                _logger.exception("Namespace binding failed.")
-                raise
+        try:
+            binds_table = self.tables["namespace_binds"]
+            prefix = text_type(prefix)
+            namespace = text_type(namespace)
+            self.session_manger.session.execute(delete(binds_table).where(
+                expression.or_(binds_table.c.uri == namespace,
+                    binds_table.c.prefix == prefix)))
+            self.session_manger.session.execute(binds_table.insert().values(prefix=prefix, uri=namespace))
+        except Exception:
+            _logger.exception("Namespace binding failed.")
+            raise
 
     def prefix(self, namespace):
         """Prefix."""
-        with self.Session.begin() as session:
-            nb_table = self.tables["namespace_binds"]
-            namespace = text_type(namespace)
-            s = select([nb_table.c.prefix]).where(nb_table.c.uri == namespace)
-            res = session.execute(s)
-            rt = [rtTuple[0] for rtTuple in res.fetchall()]
-            res.close()
-            if rt and (rt[0] or rt[0] == ""):
-                return rt[0]
+        nb_table = self.tables["namespace_binds"]
+        namespace = text_type(namespace)
+        s = select([nb_table.c.prefix]).where(nb_table.c.uri == namespace)
+        res = self.session_manger.session.execute(s)
+        rt = [rtTuple[0] for rtTuple in res.fetchall()]
+        res.close()
+        if rt and (rt[0] or rt[0] == ""):
+            return rt[0]
+
         return None
 
     def namespace(self, prefix):
         res = None
         prefix_val = text_type(prefix)
         try:
-            with self.Session.begin() as session:
-                nb_table = self.tables["namespace_binds"]
-                s = select([nb_table.c.uri]).where(nb_table.c.prefix == prefix_val)
-                res = session.execute(s)
-                rt = [rtTuple[0] for rtTuple in res.fetchall()]
-                res.close()
-                return rt and URIRef(rt[0]) or None
+            nb_table = self.tables["namespace_binds"]
+            s = select([nb_table.c.uri]).where(nb_table.c.prefix == prefix_val)
+            res = self.session_manger.session.execute(s)
+            rt = [rtTuple[0] for rtTuple in res.fetchall()]
+            res.close()
+            return rt and URIRef(rt[0]) or None
         except Exception:
             _logger.warning('exception in namespace retrieval', exc_info=True)
             return None
 
     def namespaces(self):
-        with self.Session.begin() as session:
-            res = session.execute(self.tables["namespace_binds"].select(distinct=True))
-            for prefix, uri in res.fetchall():
-                yield prefix, uri
+        res = self.session_manger.session.execute(self.tables["namespace_binds"].select(distinct=True))
+        for prefix, uri in res.fetchall():
+            yield prefix, uri
 
     # Private methods
 
@@ -753,15 +726,14 @@ class SQLAlchemy(Store, SQLGeneratorMixin, StatisticsMixin):
         asserted_type_table = self.tables["type_statements"]
         literal_table = self.tables["literal_statements"]
 
-        with self.Session.begin() as session:
-            try:
-                for table in [quoted_table, asserted_table,
-                              asserted_type_table, literal_table]:
-                    clause = self.build_context_clause(context, table)
-                    session.execute(table.delete(clause))
-            except Exception:
-                _logger.exception("Context removal failed.")
-                raise
+        try:
+            for table in [quoted_table, asserted_table,
+                            asserted_type_table, literal_table]:
+                clause = self.build_context_clause(context, table)
+                self.session_manger.execute(table.delete(clause))
+        except Exception:
+            _logger.exception("Context removal failed.")
+            raise
 
     def _verify_store_exists(self):
         """
